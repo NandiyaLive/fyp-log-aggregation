@@ -1,0 +1,30 @@
+clusterName: opensearch-cluster
+nodeGroup: master
+masterService: opensearch-cluster-master
+singleNode: true
+replicas: 1
+
+config:
+  opensearch.yml: |
+    cluster.name: opensearch-cluster
+    network.host: 0.0.0.0
+    plugins.security.disabled: true
+    discovery.type: single-node
+
+resources:
+  requests:
+    cpu: "1000m"
+    memory: "4Gi"
+  limits:
+    cpu: "2000m"
+    memory: "8Gi"
+
+persistence:
+  enabled: true
+  size: 100Gi
+  accessModes:
+    - ReadWriteOnce
+
+service:
+  type: ClusterIP
+  port: 9200

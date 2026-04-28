@@ -1,0 +1,11 @@
+# Runtime data and secrets
+results/
+output/
+*.log
+.env
+secrets/
+
+# OS
+.DS_Store
+.idea/
+.vscode/

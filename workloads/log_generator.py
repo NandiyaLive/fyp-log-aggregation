@@ -120,25 +120,32 @@ def generate_logs(total_logs=1_000_000, duplicate_ratio=0.5, output_file="/tmp/w
     duplicate_count = total_logs - unique_count
     print(f"Generating {total_logs} logs: {unique_count} unique, {duplicate_count} duplicates")
 
-    unique_logs = []
+    logs = []
     for i in range(unique_count):
-        unique_logs.append(generate_unique_log())
-        if i % 10000 == 0:
+        logs.append(generate_unique_log())
+        if i % 100000 == 0:
             print(f"  {i} unique...")
 
-    all_logs = unique_logs.copy()
     for i in range(duplicate_count):
-        source_log = json.loads(random.choice(unique_logs))
+        if unique_count > 0:
+            source_log = json.loads(logs[random.randrange(unique_count)])
+        else:
+            source_log = json.loads(generate_unique_log())
         source_log['timestamp'] = datetime.now(timezone.utc).isoformat()
-        all_logs.append(json.dumps(source_log))
-        if i % 10000 == 0:
+        logs.append(json.dumps(source_log))
+        if i % 100000 == 0:
             print(f"  {i} duplicates...")
 
-    random.shuffle(all_logs)
-    with open(output_file, 'w') as f:
-        for log in all_logs:
+    random.shuffle(logs)
+
+    # Write to a temp file first, then atomically rename. The emitter waits
+    # for the final path, so it never reads a partially-written file.
+    tmp_file = output_file + ".partial"
+    with open(tmp_file, 'w') as f:
+        for log in logs:
             f.write(log + '\n')
-    print(f"Done: {output_file}")
+    os.rename(tmp_file, output_file)
+    print(f"Done: {output_file} ({len(logs)} lines)")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

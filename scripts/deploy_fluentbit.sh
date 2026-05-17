@@ -33,6 +33,10 @@ kubectl create configmap fluent-bit-config \
 
 # Deploy DaemonSet from repo file
 kubectl apply -f configs/fluent-bit-ds.yaml -n logging
-kubectl rollout status daemonset fluent-bit -n logging --timeout=120s
+
+# The DaemonSet spec is unchanged between pipelines, so a plain apply will not
+# roll the pods. Restart explicitly so the updated ConfigMap is picked up.
+kubectl rollout restart daemonset fluent-bit -n logging
+kubectl rollout status daemonset fluent-bit -n logging --timeout=180s
 
 echo "Pipeline $PIPELINE deployed"

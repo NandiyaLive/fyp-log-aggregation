@@ -11,6 +11,10 @@ config:
     plugins.security.disabled: true
     discovery.type: single-node
 
+# JVM heap. Kept at half the 4Gi container limit, leaving room for off-heap
+# Lucene buffers; sized for an 8 GB droplet shared with k3s and Fluent Bit.
+opensearchJavaOpts: "-Xmx2g -Xms2g"
+
 resources:
   requests:
     cpu: "500m"

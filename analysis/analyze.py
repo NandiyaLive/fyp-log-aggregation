@@ -11,10 +11,6 @@ OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
-def load_data(mode):
-    return pd.read_csv(RESULTS_DIR / f"experiments_{mode}.csv")
-
-
 def calculate_metrics(df):
     baseline = df[df["pipeline"] == "A"].set_index("workload_id")["storage"].to_dict()
     metrics = []
@@ -96,27 +92,6 @@ def plot_tradeoff(df):
     plt.close()
 
 
-def plot_cumulative_no_clean_slate():
-    df = load_data("no_clean_slate")
-    fig, ax = plt.subplots(figsize=(12, 7))
-    for p in ["A", "B", "C"]:
-        data = df[df["pipeline"] == p].sort_values("workload_id")
-        cum_mb = data["total_storage"].cumsum() / (1024 * 1024)
-        ax.plot(
-            data["workload_id"], cum_mb, marker="o", markersize=2, label=f"Pipeline {p}"
-        )
-    ax.set_xlabel("Workload Number (Sequential, No Clean Slate)")
-    ax.set_ylabel("Cumulative Storage (MB)")
-    ax.set_title("Cumulative Storage Growth Without Clean Slate")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.axvline(x=33, color="gray", linestyle="--", alpha=0.5)
-    ax.axvline(x=73, color="gray", linestyle="--", alpha=0.5)
-    plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "cumulative_no_clean_slate.png", dpi=300)
-    plt.close()
-
-
 def plot_srr_by_dup(df):
     fig, ax = plt.subplots(figsize=(12, 6))
     colors = {"A": "gray", "B": "red", "C": "blue"}
@@ -182,22 +157,107 @@ def generate_table(df):
     ]
 
 
-def main():
-    print("Analyzing...")
-    df_clean = calculate_metrics(load_data("clean_slate"))
+def plot_cumulative_no_clean_slate(df):
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for p in ["A", "B", "C"]:
+        data = df[df["pipeline"] == p].sort_values("workload_id")
+        if data.empty:
+            continue
+        # total_storage is already the running cluster footprint after each
+        # workload, so it is plotted directly (no cumulative sum).
+        storage_mb = data["total_storage"] / (1024 * 1024)
+        ax.plot(
+            data["workload_id"],
+            storage_mb,
+            marker="o",
+            markersize=2,
+            label=f"Pipeline {p}",
+        )
+    ax.set_xlabel("Workload Number (Sequential, No Clean Slate)")
+    ax.set_ylabel("Cumulative Storage (MB)")
+    ax.set_title("Cumulative Storage Growth Without Clean Slate")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axvline(x=33, color="gray", linestyle="--", alpha=0.5)
+    ax.axvline(x=73, color="gray", linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "cumulative_no_clean_slate.png", dpi=300)
+    plt.close()
 
-    plot_failure_impact(df_clean)
-    plot_tradeoff(df_clean)
-    plot_srr_by_dup(df_clean)
-    plot_cumulative_no_clean_slate()
 
-    table = generate_table(df_clean)
+def summarize_no_clean_slate(df):
+    finals = {}
+    for p in ["A", "B", "C"]:
+        data = df[df["pipeline"] == p].sort_values("workload_id")
+        if not data.empty:
+            finals[p] = data.iloc[-1]
+
+    base = finals["A"]["total_storage"] if "A" in finals else 0
+    rows = []
+    for p in ["A", "B", "C"]:
+        if p not in finals:
+            continue
+        last = finals[p]
+        final_storage = last["total_storage"]
+        srr = 1 - (final_storage / base) if base > 0 else 0
+        rows.append(
+            {
+                "Pipeline": p,
+                "Workloads": int(df[df["pipeline"] == p].shape[0]),
+                "Final_Docs": int(last["M"]),
+                "Final_Storage_MB": round(final_storage / (1024 * 1024), 2),
+                "Cumulative_SRR": round(srr, 4),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def analyze_clean_slate(csv_path):
+    print("Clean-slate analysis...")
+    df = calculate_metrics(pd.read_csv(csv_path))
+    plot_failure_impact(df)
+    plot_tradeoff(df)
+    plot_srr_by_dup(df)
+    table = generate_table(df)
     table.to_csv(OUTPUT_DIR / "comparison_table.csv", index=False)
     table.to_markdown(OUTPUT_DIR / "comparison_table.md", index=False)
-
-    print("\n=== RESULTS ===")
+    print("\n=== CLEAN SLATE RESULTS ===")
     print(table.to_markdown(index=False))
-    print(f"\nSaved to {OUTPUT_DIR}")
+
+
+def analyze_no_clean_slate(csv_path):
+    print("No-clean-slate analysis...")
+    df = pd.read_csv(csv_path)
+    plot_cumulative_no_clean_slate(df)
+    summary = summarize_no_clean_slate(df)
+    summary.to_csv(OUTPUT_DIR / "cumulative_summary.csv", index=False)
+    summary.to_markdown(OUTPUT_DIR / "cumulative_summary.md", index=False)
+    print("\n=== NO CLEAN SLATE RESULTS ===")
+    print(summary.to_markdown(index=False))
+
+
+def main():
+    print("Analyzing...")
+    ran = False
+
+    clean_csv = RESULTS_DIR / "experiments_clean_slate.csv"
+    if clean_csv.exists():
+        analyze_clean_slate(clean_csv)
+        ran = True
+    else:
+        print(f"Skipping clean-slate: {clean_csv} not found")
+
+    ncs_csv = RESULTS_DIR / "experiments_no_clean_slate.csv"
+    if ncs_csv.exists():
+        analyze_no_clean_slate(ncs_csv)
+        ran = True
+    else:
+        print(f"Skipping no-clean-slate: {ncs_csv} not found")
+
+    if ran:
+        print(f"\nSaved to {OUTPUT_DIR}")
+    else:
+        print("No result CSVs found. Run ./scripts/run_all.sh first.")
 
 
 if __name__ == "__main__":

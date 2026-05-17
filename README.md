@@ -85,6 +85,7 @@ Each workload: 1,000,000 synthetic logs with deterministic seeding.
 
 - DigitalOcean droplet: 8 vCPU, 16 GB RAM, 320 GB SSD
 - Domain or static IP (for k3s TLS SAN)
+- Install `jq`: `sudo apt-get install -y jq`
 
 ### Server Setup (one-time, as root)
 
@@ -99,12 +100,9 @@ curl -sfL https://get.k3s.io | sh -s - server --disable traefik --write-kubeconf
 ### Experiment Setup (as researcher)
 
 ```bash
-# Clone
-git clone https://github.com/YOUR_USERNAME/fyp-log-aggregation.git
-cd fyp-log-aggregation
-
-# Runtime directories
-mkdir -p results output
+# Install prerequisites and runtime directories
+pip3 install numpy pandas matplotlib
+mkdir -p results output workloads/logs
 
 # Infrastructure
 ./scripts/install_opensearch.sh

@@ -13,9 +13,6 @@ CLEAN_SLATE=${5:-true}
 # Clean slate if requested
 if [ "$CLEAN_SLATE" = "true" ]; then
     echo "=== CLEAN SLATE ==="
-    read -p "Delete all OpenSearch data? (y/n) " confirm
-    [ "$confirm" != "y" ] && exit 1
-
     curl -s -X DELETE "http://localhost:9200/_all?expand_wildcards=all&allow_no_indices=true" || true
     curl -s -X POST "http://localhost:9200/_cache/clear" || true
     kubectl delete job log-workload -n default --ignore-not-found=true

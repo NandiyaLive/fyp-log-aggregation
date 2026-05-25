@@ -2,6 +2,7 @@
 # Run a single experiment: one pipeline against one workload.
 # Usage: ./run_experiment.sh <A|B|C> <workload_id> <dup_ratio> <seed> [clean_slate:true|false]
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
 PIPELINE=${1:-}
 WL_ID=${2:-}

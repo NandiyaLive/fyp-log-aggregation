@@ -3,6 +3,7 @@
 # A single failed experiment is logged and skipped; the matrix continues.
 # Usage: ./scripts/run_all.sh <clean_slate|no_clean_slate>
 set -uo pipefail
+cd "$(dirname "$0")/.."
 
 MODE=${1:-clean_slate}
 

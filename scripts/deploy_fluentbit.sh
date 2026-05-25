@@ -3,6 +3,7 @@
 # Deploys Fluent Bit DaemonSet with selected pipeline config
 
 set -e
+cd "$(dirname "$0")/.."
 PIPELINE=${1:-A}
 
 case $PIPELINE in

@@ -21,13 +21,13 @@ def calculate_metrics(df):
         base_storage = baseline.get(wl_id, storage)
         SRR = 1 - (storage / base_storage) if base_storage > 0 else 0
         CE = N / M if M > 0 else 0
-        IPR = (
-            1.0
-            if pipeline in ["A", "C"]
-            else min(1.0, M / (N * (1 - row["dup_ratio"]) + 1))
-            if row["dup_ratio"] < 1
-            else 0.99
-        )
+        unique_expected = N * (1 - row["dup_ratio"]) + 1
+        if pipeline == "A":
+            IPR = 1.0
+        elif pipeline == "B":
+            IPR = min(1.0, M / unique_expected) if row["dup_ratio"] < 1 else 0.99
+        else:  # C: upsert preserves unique events; measure against unique expected
+            IPR = min(1.0, M / unique_expected) if row["dup_ratio"] < 1 else 0.99
         category = (
             "low"
             if row["dup_ratio"] <= 0.30
@@ -59,16 +59,19 @@ def plot_failure_impact(df):
     x = np.arange(len(pipelines))
     width = 0.35
     normal = [df[df["pipeline"] == p]["IPR"].mean() for p in pipelines]
-    failure = [1.0, 0.96, 1.0]
+    # Theoretical failure scenario: edge collector crash loses in-flight buffer.
+    # A and C are unaffected (A has no filter; C commits to storage before dedup).
+    # B loses records not yet flushed; empirical estimate ~4% based on flush interval.
+    failure = [normal[0], normal[1] * 0.96, normal[2]]
     ax.bar(x - width / 2, normal, width, label="No Failure", color="steelblue")
-    ax.bar(x + width / 2, failure, width, label="With Failure", color="coral")
+    ax.bar(x + width / 2, failure, width, label="With Failure (theoretical)", color="coral")
     ax.set_xlabel("Pipeline")
     ax.set_ylabel("IPR")
-    ax.set_title("Failure Impact on Information Preservation")
+    ax.set_title("Failure Impact on Information Preservation (B: theoretical estimate)")
     ax.set_xticks(x)
     ax.set_xticklabels(["Baseline", "Edge", "Index-Time"])
     ax.legend()
-    ax.set_ylim(0.9, 1.01)
+    ax.set_ylim(0, 1.05)
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / "failure_impact.png", dpi=300)
     plt.close()
@@ -84,7 +87,7 @@ def plot_tradeoff(df):
     ax.set_ylabel("Information Preservation Ratio (IPR)")
     ax.set_title("Trade-off: Storage Reduction vs Information Preservation")
     ax.set_xlim(-0.05, 1.05)
-    ax.set_ylim(0.9, 1.01)
+    ax.set_ylim(-0.05, 1.05)
     ax.grid(True, alpha=0.3)
     ax.legend()
     plt.tight_layout()

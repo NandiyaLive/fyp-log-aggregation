@@ -37,9 +37,9 @@ echo "pipeline,workload_id,dup_ratio,seed,N,M,storage,total_storage,timestamp" >
 run_one() {
     local pipeline=$1 id=$2 ratio=$3 seed=$4 clean=$5
     local before after
-    before=$(wc -l < results/experiments.csv 2>/dev/null || echo 0)
+    before=$([ -f results/experiments.csv ] && wc -l < results/experiments.csv || echo 0)
     if ./scripts/run_experiment.sh "$pipeline" "$id" "$ratio" "$seed" "$clean"; then
-        after=$(wc -l < results/experiments.csv 2>/dev/null || echo 0)
+        after=$([ -f results/experiments.csv ] && wc -l < results/experiments.csv || echo 0)
         if [ "$after" -gt "$before" ]; then
             tail -1 results/experiments.csv >> "$CSV"
         else

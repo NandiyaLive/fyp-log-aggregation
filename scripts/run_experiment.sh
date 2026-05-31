@@ -1,6 +1,11 @@
 #!/bin/bash
 # Run a single experiment: one pipeline against one workload.
-# Usage: ./run_experiment.sh <A|B|C> <workload_id> <dup_ratio> <seed> [clean_slate:true|false]
+# Usage: ./run_experiment.sh <A|B|C> <workload_id> <dup_ratio> <seed> [clean_slate:true|false] [fail:true|false]
+#
+# fail=true injects a real collector crash: once indexing reaches ~50% it
+# deletes the Fluent Bit pod, then lets the DaemonSet bring it back. Whatever
+# the edge buffer had not yet forwarded is genuinely lost, so the measured
+# reconstructed count (and hence IPR/FLR) reflects an empirical failure.
 set -euo pipefail
 
 PIPELINE=${1:-}
@@ -8,9 +13,10 @@ WL_ID=${2:-}
 DUP_RATIO=${3:-}
 SEED=${4:-}
 CLEAN_SLATE=${5:-true}
+FAIL=${6:-false}
 
 if [ -z "$PIPELINE" ] || [ -z "$WL_ID" ] || [ -z "$DUP_RATIO" ] || [ -z "$SEED" ]; then
-    echo "Usage: $0 <A|B|C> <wl_id> <dup_ratio> <seed> [clean_slate]" >&2
+    echo "Usage: $0 <A|B|C> <wl_id> <dup_ratio> <seed> [clean_slate] [fail]" >&2
     exit 1
 fi
 
@@ -38,6 +44,48 @@ get_count() {
 
 get_index_total() {
     os_get "/$1/_stats/indexing" | jq -r '._all.total.indexing.index_total // 0' 2>/dev/null || echo 0
+}
+
+# Sum of the per-document `count` field = number of original log lines the
+# index claims to represent (the reconstructed volume). Pipeline A has no
+# `count` field, so this returns 0 there and the caller falls back to doc count.
+get_reconstructed() {
+    local body i out
+    for i in 1 2 3; do
+        out=$(curl -s --max-time 30 -H 'Content-Type: application/json' \
+            -X POST "${OS_URL}/$1/_search?size=0" \
+            -d '{"aggs":{"recon":{"sum":{"field":"count"}}}}' 2>/dev/null || true)
+        body=$(echo "$out" | jq -r '.aggregations.recon.value // 0' 2>/dev/null || echo 0)
+        if [ -n "$body" ] && [ "$body" != "null" ]; then echo "$body"; return 0; fi
+        sleep 3
+    done
+    echo 0
+}
+
+# Force a single segment and refresh so store-size and counts are stable and
+# comparable across pipelines (upsert churn otherwise leaves deleted-doc bloat
+# that makes index-time look far larger than it really is).
+settle_index() {
+    curl -s --max-time 120 -X POST "${OS_URL}/$1/_forcemerge?max_num_segments=1&wait_for_completion=true&only_expunge_deletes=false" >/dev/null 2>&1 || true
+    curl -s --max-time 30 -X POST "${OS_URL}/$1/_refresh" >/dev/null 2>&1 || true
+    sleep 5
+}
+
+# Background failure injector: wait until indexing crosses ~half the workload,
+# then delete the Fluent Bit pod once.
+TOTAL_LOGS=1000000
+inject_failure() {
+    local index=$1 threshold=$((TOTAL_LOGS / 2)) i total
+    for i in $(seq 1 "$INDEX_POLL_MAX"); do
+        sleep 5
+        total=$(get_index_total "$index")
+        if [ "$total" -ge "$threshold" ] 2>/dev/null; then
+            echo "  [FAIL-INJECT] index_total=$total >= $threshold : killing Fluent Bit pod"
+            kubectl delete pod -l k8s-app=fluent-bit -n logging --grace-period=0 --force >/dev/null 2>&1 || true
+            return 0
+        fi
+    done
+    echo "  [FAIL-INJECT] threshold never reached; no crash injected"
 }
 
 # Wait until Fluent Bit has finished indexing the current workload.
@@ -145,8 +193,19 @@ INDEX_NAME="logs"
 [ "$PIPELINE" = "B" ] && INDEX_NAME="logs-edge"
 [ "$PIPELINE" = "C" ] && INDEX_NAME="logs-index"
 
+# Optional crash injection runs concurrently with indexing.
+if [ "$FAIL" = "true" ]; then
+    echo "Failure mode ON: will crash Fluent Bit at ~50% indexed."
+    inject_failure "$INDEX_NAME" &
+    FAIL_PID=$!
+fi
+
 echo "Waiting for Fluent Bit to finish indexing into '$INDEX_NAME'..."
 wait_for_indexing "$INDEX_NAME"
+[ -n "${FAIL_PID:-}" ] && wait "$FAIL_PID" 2>/dev/null || true
+
+# Stabilize storage and counts before measuring.
+settle_index "$INDEX_NAME"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RESULT_DIR="results/${PIPELINE}_wl${WL_ID}_${TIMESTAMP}"
@@ -158,13 +217,20 @@ TOTAL_STATS=$(os_get "/_stats/store")
 STORAGE=$(echo "$STATS" | jq -r '._all.total.store.size_in_bytes // 0' 2>/dev/null || echo 0)
 TOTAL_STORAGE=$(echo "$TOTAL_STATS" | jq -r '._all.total.store.size_in_bytes // 0' 2>/dev/null || echo 0)
 
-echo "1000000" > "$RESULT_DIR/N.txt"
+# Reconstructed = original lines the index represents. Pipeline A keeps every
+# line as its own doc (no count field), so reconstructed == doc count there.
+RECON=$(get_reconstructed "$INDEX_NAME")
+RECON=${RECON%.*}
+if [ "${RECON:-0}" = "0" ]; then RECON=$DOC_COUNT; fi
+
+echo "$TOTAL_LOGS" > "$RESULT_DIR/N.txt"
 echo "$DOC_COUNT" > "$RESULT_DIR/M.txt"
 echo "$STATS" > "$RESULT_DIR/stats.json"
 echo "$STORAGE" > "$RESULT_DIR/storage.txt"
 echo "$TOTAL_STORAGE" > "$RESULT_DIR/total_storage.txt"
+echo "$RECON" > "$RESULT_DIR/reconstructed.txt"
 
 mkdir -p results
-echo "${PIPELINE},${WL_ID},${DUP_RATIO},${SEED},1000000,${DOC_COUNT},${STORAGE},${TOTAL_STORAGE},${TIMESTAMP}" >> results/experiments.csv
+echo "${PIPELINE},${WL_ID},${DUP_RATIO},${SEED},${TOTAL_LOGS},${DOC_COUNT},${STORAGE},${TOTAL_STORAGE},${RECON},${FAIL},${TIMESTAMP}" >> results/experiments.csv
 
-echo "Done: $RESULT_DIR | Docs=$DOC_COUNT | Storage=$STORAGE | TotalStorage=$TOTAL_STORAGE"
+echo "Done: $RESULT_DIR | Docs=$DOC_COUNT | Storage=$STORAGE | Recon=$RECON | Failed=$FAIL"

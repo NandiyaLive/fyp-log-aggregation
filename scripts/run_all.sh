@@ -6,10 +6,15 @@ set -uo pipefail
 
 MODE=${1:-clean_slate}
 
-if [ "$MODE" != "clean_slate" ] && [ "$MODE" != "no_clean_slate" ]; then
-    echo "Usage: $0 <clean_slate|no_clean_slate>" >&2
+if [ "$MODE" != "clean_slate" ] && [ "$MODE" != "no_clean_slate" ] && [ "$MODE" != "failure" ]; then
+    echo "Usage: $0 <clean_slate|no_clean_slate|failure>" >&2
     exit 1
 fi
+
+# failure mode: same as clean_slate but injects a real collector crash into
+# every run so the analysis can compute empirical FLR.
+INJECT_FAIL=false
+[ "$MODE" = "failure" ] && INJECT_FAIL=true
 
 # Sanity check: OpenSearch must be reachable via the port-forward.
 if ! curl -s --max-time 10 http://localhost:9200 > /dev/null 2>&1; then
@@ -29,15 +34,15 @@ fi
 
 CSV="results/experiments_${MODE}.csv"
 FAILLOG="results/failures_${MODE}.log"
-echo "pipeline,workload_id,dup_ratio,seed,N,M,storage,total_storage,timestamp" > "$CSV"
+echo "pipeline,workload_id,dup_ratio,seed,N,M,storage,total_storage,reconstructed,failed,timestamp" > "$CSV"
 : > "$FAILLOG"
 
 # Run one experiment; append its result row on success, log it on failure.
 run_one() {
-    local pipeline=$1 id=$2 ratio=$3 seed=$4 clean=$5
+    local pipeline=$1 id=$2 ratio=$3 seed=$4 clean=$5 fail=${6:-false}
     local before after
     before=$(wc -l < results/experiments.csv 2>/dev/null || echo 0)
-    if ./scripts/run_experiment.sh "$pipeline" "$id" "$ratio" "$seed" "$clean"; then
+    if ./scripts/run_experiment.sh "$pipeline" "$id" "$ratio" "$seed" "$clean" "$fail"; then
         after=$(wc -l < results/experiments.csv 2>/dev/null || echo 0)
         if [ "$after" -gt "$before" ]; then
             tail -1 results/experiments.csv >> "$CSV"
@@ -71,10 +76,12 @@ for pipeline in A B C; do
         seed=$(echo "$wl" | jq -r '.seed')
         echo "--- WL-$id (pipeline $pipeline, dup=$ratio) ---"
 
-        if [ "$MODE" = "clean_slate" ]; then
-            run_one "$pipeline" "$id" "$ratio" "$seed" true
+        if [ "$MODE" = "no_clean_slate" ]; then
+            run_one "$pipeline" "$id" "$ratio" "$seed" false false
         else
-            run_one "$pipeline" "$id" "$ratio" "$seed" false
+            # clean_slate and failure both reset per workload; failure also
+            # injects a mid-stream collector crash.
+            run_one "$pipeline" "$id" "$ratio" "$seed" true "$INJECT_FAIL"
         fi
         sleep 10
     done

@@ -44,6 +44,20 @@ spec:
       containers:
         - name: fluent-bit
           image: cr.fluentbit.io/fluent/fluent-bit:3.1
+          env:
+            # Edge (pipeline B) re-emit threshold -> bounds normal-path
+            # information loss to ~this fraction. See semantic_aggregate.lua.
+            - name: FB_EMIT_EPS
+              value: "0.02"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              # The Lua dedup map holds one small entry per distinct signature;
+              # at dup_ratio~0 that is up to ~1M entries. 1Gi is ample headroom.
+              cpu: "2"
+              memory: "1Gi"
           volumeMounts:
             - name: varlog
               mountPath: /var/log
@@ -52,6 +66,8 @@ spec:
               readOnly: true
             - name: fluent-bit-config
               mountPath: /fluent-bit/etc/
+            - name: fluent-bit-state
+              mountPath: /fluent-bit/state
       volumes:
         - name: varlog
           hostPath:
@@ -62,3 +78,13 @@ spec:
         - name: fluent-bit-config
           configMap:
             name: fluent-bit-config
+        # Tail position DB lives on the node, so it survives a pod crash. On
+        # restart Fluent Bit resumes from the last committed offset instead of
+        # re-reading the log from the start — which is what makes the injected
+        # failure a clean, permanent loss (measurable FLR). Each workload uses
+        # a new pod => new container log filename, so clean-slate runs still
+        # read every workload from the beginning.
+        - name: fluent-bit-state
+          hostPath:
+            path: /var/lib/fluent-bit-state
+            type: DirectoryOrCreate

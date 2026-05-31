@@ -35,14 +35,43 @@ From experimental results, practitioners can derive rules such as:
 
 Each workload: 1,000,000 synthetic logs with deterministic seeding.
 
-## Metrics
+### What `dup_ratio` controls (the core invariant)
+
+The pipelines deduplicate on a **normalized template signature**
+(`level | component | message` with numbers→`{NUM}`, IPs→`{IP}`, UUIDs→`{UUID}`,
+quoted strings→`{STR}`). Storage reduction is therefore driven by the number of
+**distinct signatures**, not by byte-identical lines. The generator makes
+`dup_ratio` (`r`) control exactly that quantity:
+
+```
+distinct events U = round(N · (1 − r))      → one indexed doc per signature
+theoretical SRR   = 1 − U/N = r             → SRR is a direct function of r
+compression eff.  = N / U   = 1 / (1 − r)
+```
+
+Each distinct event gets a unique, normalization-surviving `entity` token, so
+its signature is unique; repeats (Zipf-biased) reuse an existing signature.
+This is the property the old generator lacked — there, all 1M lines collapsed
+to ~388 signatures regardless of `r`, so SRR was flat and the framework had no
+signal. The contract is verified empirically (distinct signatures == `N·(1−r)`
+at every ratio).
+
+## Metrics (all measured, none hardcoded)
 
 | Metric | Symbol | Definition |
 |:---|:---|:---|
-| Storage Reduction Ratio | SRR | 1 − (Storage_aggregated / Storage_baseline) |
-| Information Preservation Ratio | IPR | Logs reconstructable / Logs sent |
-| Compression Efficiency | CE | Total logs / Documents indexed |
-| Failure Loss Rate | FLR | 1 − IPR under simulated collector crash |
+| Storage Reduction Ratio | SRR | 1 − (Storage_aggregated / Storage_baseline), real bytes after force-merge |
+| Theoretical SRR | SRR* | `dup_ratio` — the reduction a perfect deduper achieves (reference line) |
+| Information Preservation Ratio | IPR | `reconstructed / N` = sum of per-doc `count` field ÷ original lines |
+| Compression Efficiency | CE | Total logs N / Documents indexed M |
+| Failure Loss Rate | FLR | IPR_normal − IPR_failure, from a run with a real collector crash |
+
+Each aggregated document carries a `count` field (cumulative occurrences of its
+signature). Pipeline B (edge) re-emits the count only when it grows by
+`FB_EMIT_EPS` (default 2%), upserting by signature — so it forwards far fewer
+records (edge reduction) at the cost of a small, bounded count lag, and loses
+its in-memory tail on a crash. Pipeline C (index-time) forwards every record and
+upserts by signature, so counts are exact and crash exposure is minimal.
 
 ## Repository Structure
 
@@ -207,16 +236,29 @@ Run **both** modes — the analysis step needs both result files. Each mode runs
 3 pipelines × 100 workloads and takes several hours; run inside `tmux`/`screen`.
 
 ```bash
-# Clean slate: a fresh OpenSearch index per workload
+# Clean slate: a fresh OpenSearch index per workload (normal-path metrics)
 ./scripts/run_all.sh clean_slate
 
 # No clean slate: cumulative index growth analysis
 ./scripts/run_all.sh no_clean_slate
+
+# Failure: clean slate + a real collector crash injected at ~50% indexed,
+# so FLR is measured empirically (needed for the failure-impact figure).
+./scripts/run_all.sh failure
 ```
 
 A failed individual experiment is logged to `results/failures_<mode>.log` and
 skipped; the matrix continues. Results are written to
-`results/experiments_<mode>.csv`.
+`results/experiments_<mode>.csv` with columns
+`pipeline,workload_id,dup_ratio,seed,N,M,storage,total_storage,reconstructed,failed,timestamp`.
+
+> **Failure-mode note:** the crash is injected by deleting the Fluent Bit pod.
+> Whatever the edge buffer (pipeline B) had not yet forwarded is lost, which is
+> the effect under test. After restart the DaemonSet resumes tailing; if you
+> see IPR recover to ~1.0 under failure, the collector re-read the log from the
+> start — pin the tail position on a `hostPath` volume (instead of the
+> ephemeral `/tmp/fluent-bit-kube.db`) so the failure is a clean, permanent
+> loss. Verify a failure run actually shows `reconstructed < N` for B.
 
 ## 9. Analyze
 
@@ -243,13 +285,28 @@ Outputs in `output/`:
 
 ## Key Results (Expected)
 
-| Pipeline | High-Dup SRR | High-Dup IPR | Failure Sensitivity | Decision Rule |
-|:---|:---|:---|:---|:---|
-| Baseline (A) | 0% | 100% | None | Never optimal for dup >30% |
-| Edge (B) | ~85–92% | ~97–99% | Loses 3–4% under crash | Use when cost dominates, failures rare |
-| Index-Time (C) | ~85–89% | 100% | Zero loss guaranteed | Use when reliability is critical |
+With the redesigned setup, SRR now tracks `dup_ratio`: at high dup (`r≈0.9`)
+both aggregating pipelines approach ~90% storage reduction; at low dup they
+correctly show little reduction. The interesting findings are the **gap** from
+the theoretical line (per-document and segment overhead) and the
+**failure split** between edge and index-time.
 
-**Trade-off:** Edge aggregation achieves marginally higher storage reduction at the cost of bounded information loss during collector failure. Index-time aggregation guarantees zero loss with slightly lower savings. The decision framework maps these trade-offs to operational requirements.
+| Pipeline | High-Dup SRR | High-Dup IPR (normal) | IPR (under crash) | Decision Rule |
+|:---|:---|:---|:---|:---|
+| Baseline (A) | ~0% | 100% | 100% | Never optimal for dup >30% |
+| Edge (B) | ≈ `r` (≈90%) | ~99.9% (bounded by `FB_EMIT_EPS`) | drops by the unforwarded tail | Use when ingest cost dominates and crashes are rare |
+| Index-Time (C) | ≈ `r`, minus overhead | 100% | ~100% | Use when completeness is critical |
+
+**Trade-off:** Edge aggregation forwards far fewer records (lower ingest/network
+cost) but exposes an in-memory buffer that is lost on collector crash.
+Index-time aggregation forwards everything (higher ingest cost) but preserves
+exact counts and survives crashes. Both reach the same storage floor (~`r`); the
+decision is ingest-cost vs. crash-completeness. The framework maps `dup_ratio`
+and the operational failure tolerance to the appropriate pipeline.
+
+Validation performed on this setup: distinct normalized signatures == `N·(1−r)`
+at `r ∈ {0, 0.3, 0.6, 0.9}` (so SRR≈`r`), simulated `IPR_C = 1.000`,
+`IPR_B ≈ 0.999` normal, `CE = 1/(1−r)`.
 
 ## Graphs Generated
 

@@ -3,6 +3,7 @@
 # A single failed experiment is logged and skipped; the matrix continues.
 # Usage: ./scripts/run_all.sh <clean_slate|no_clean_slate>
 set -uo pipefail
+cd "$(dirname "$0")/.."
 
 MODE=${1:-clean_slate}
 
@@ -41,9 +42,9 @@ echo "pipeline,workload_id,dup_ratio,seed,N,M,storage,total_storage,reconstructe
 run_one() {
     local pipeline=$1 id=$2 ratio=$3 seed=$4 clean=$5 fail=${6:-false}
     local before after
-    before=$(wc -l < results/experiments.csv 2>/dev/null || echo 0)
+    before=$([ -f results/experiments.csv ] && wc -l < results/experiments.csv || echo 0)
     if ./scripts/run_experiment.sh "$pipeline" "$id" "$ratio" "$seed" "$clean" "$fail"; then
-        after=$(wc -l < results/experiments.csv 2>/dev/null || echo 0)
+        after=$([ -f results/experiments.csv ] && wc -l < results/experiments.csv || echo 0)
         if [ "$after" -gt "$before" ]; then
             tail -1 results/experiments.csv >> "$CSV"
         else

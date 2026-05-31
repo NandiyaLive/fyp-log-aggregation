@@ -7,6 +7,7 @@
 # the edge buffer had not yet forwarded is genuinely lost, so the measured
 # reconstructed count (and hence IPR/FLR) reflects an empirical failure.
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
 PIPELINE=${1:-}
 WL_ID=${2:-}

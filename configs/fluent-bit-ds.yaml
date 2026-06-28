@@ -68,6 +68,8 @@ spec:
               mountPath: /fluent-bit/etc/
             - name: fluent-bit-state
               mountPath: /fluent-bit/state
+            - name: fluent-bit-buffer
+              mountPath: /fluent-bit/buffer
       volumes:
         - name: varlog
           hostPath:
@@ -88,3 +90,9 @@ spec:
           hostPath:
             path: /var/lib/fluent-bit-state
             type: DirectoryOrCreate
+        # Filesystem-buffer chunks. Pod-local emptyDir on purpose: it is wiped
+        # when the pod is deleted, so an injected Fluent Bit kill loses whatever
+        # was buffered-but-unflushed -> clean, permanent loss (measurable FLR).
+        # During normal runs it just decouples tail throughput from OpenSearch.
+        - name: fluent-bit-buffer
+          emptyDir: {}

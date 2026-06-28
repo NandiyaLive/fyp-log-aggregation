@@ -134,6 +134,10 @@ fi
 log "Enabling fail2ban..."
 systemctl enable --now fail2ban
 
+# ── 10. Harden ────────────────────────────────────────────────────────────────
+log "Running hardening script..."
+bash "${RESEARCH_HOME}/research/scripts/harden.sh"
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 log ""
 log "=== Provisioning complete ==="

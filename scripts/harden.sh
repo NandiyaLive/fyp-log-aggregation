@@ -201,8 +201,9 @@ log "Unattended security upgrades enabled."
 # ── 6. Docker daemon hardening ────────────────────────────────────────────────
 log "Hardening Docker daemon..."
 
-mkdir -p /etc/docker
-cat > /etc/docker/daemon.json <<'EOF'
+if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^docker.service"; then
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json <<'EOF'
 {
   "no-new-privileges": true,
   "userland-proxy": false,
@@ -215,9 +216,11 @@ cat > /etc/docker/daemon.json <<'EOF'
   "live-restore": true
 }
 EOF
-
-systemctl reload-or-restart docker
-log "Docker daemon hardened."
+    systemctl reload-or-restart docker
+    log "Docker daemon hardened."
+else
+    warn "Docker not installed — skipping Docker hardening. Run after provision.sh."
+fi
 
 # ── 7. Disable unused services ────────────────────────────────────────────────
 log "Disabling unnecessary services..."

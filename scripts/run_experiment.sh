@@ -116,38 +116,53 @@ inject_failure() {
 }
 
 # Wait until Fluent Bit has finished indexing the current workload.
-# Tracks the index-operation counter, not the document count: pipelines B
-# (edge dedup) and C (upsert) barely change the doc count, but every record
-# Fluent Bit forwards still registers as an index operation. After a warm-up
-# grace period, a plateau in index_total means indexing has drained.
+#
+# Two completion signals, in priority order:
+#   1. Fast path  -- the index-operation counter (index_total) reaches the
+#      expected volume. index_total is monotonic and counts every record
+#      Fluent Bit forwards, so it lands near TOTAL_LOGS for every pipeline
+#      regardless of dedup (B/C barely change the doc count). This is the
+#      authoritative "all lines delivered" signal.
+#   2. Plateau    -- a long flat stretch in the doc count. Used only when the
+#      fast path never fires: failure runs lose data (so index_total stops
+#      short of target) and an OpenSearch pod restart resets index_total to 0.
+#      Doc count is computed from the index itself, so it survives restart.
+#
+# The plateau window must be wider than Fluent Bit's burst gaps: it forwards in
+# bursts with >9s idle stretches between flushes, so a short window mistakes an
+# inter-flush gap for completion and stops mid-stream.
+COMPLETION_RATIO_PCT=99      # treat index_total >= 99% of TOTAL_LOGS as done
 INDEX_WARMUP_POLLS=3
-INDEX_STABLE_POLLS=3
+INDEX_STABLE_POLLS=10        # x3s = 30s flat doc count before declaring plateau
 wait_for_indexing() {
-    local index=$1 pipeline=${2:-A} prev=-1 stable=0 i total
+    local index=$1 pipeline=${2:-A} prev=-1 stable=0 i docs ops
+    local target=$((TOTAL_LOGS * COMPLETION_RATIO_PCT / 100))
     for i in $(seq 1 "$INDEX_POLL_MAX"); do
         sleep 3
-        # Use doc count for all pipelines. index_total resets to 0 when the
-        # OpenSearch pod restarts (failure-mode sink kill), which makes plateau
-        # detection stick at zero forever. _count is computed from the index
-        # itself, so it survives pod restart.
-        total=$(get_count "$index")
-        # Coerce empty / non-numeric output to 0 so `[ ... -gt ... ]` is safe.
-        case "$total" in
-            ''|*[!0-9]*) total=0 ;;
-        esac
-        echo "  [poll $i] $index ($pipeline) metric=$total"
+        docs=$(get_count "$index")
+        ops=$(get_index_total "$index")
+        # Coerce empty / non-numeric output to 0 so the integer tests are safe.
+        case "$docs" in ''|*[!0-9]*) docs=0 ;; esac
+        case "$ops"  in ''|*[!0-9]*) ops=0  ;; esac
+        echo "  [poll $i] $index ($pipeline) docs=$docs ops=$ops"
+        # Fast path: forwarding actually completed.
+        if [ "$ops" -ge "$target" ] 2>/dev/null; then
+            echo "  indexing complete (ops=$ops >= target=$target)"
+            return 0
+        fi
+        # Fallback: long doc-count plateau (failure-mode loss / ops reset).
         if [ "$i" -gt "$INDEX_WARMUP_POLLS" ] \
-           && [ "$total" -gt 0 ] \
-           && [ "$total" -eq "$prev" ] 2>/dev/null; then
+           && [ "$docs" -gt 0 ] \
+           && [ "$docs" -eq "$prev" ] 2>/dev/null; then
             stable=$((stable + 1))
             if [ "$stable" -ge "$INDEX_STABLE_POLLS" ]; then
-                echo "  indexing settled (index_total=$total)"
+                echo "  indexing settled via plateau (docs=$docs ops=$ops)"
                 return 0
             fi
         else
             stable=0
         fi
-        prev=$total
+        prev=$docs
     done
     echo "  WARN: indexing for '$index' did not settle within $((INDEX_POLL_MAX * 3))s"
 }

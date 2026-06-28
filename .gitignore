@@ -4,6 +4,7 @@ output/
 *.log
 .env
 secrets/
+docs/
 
 # OS
 .DS_Store

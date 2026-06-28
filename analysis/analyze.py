@@ -83,16 +83,22 @@ def plot_failure_impact(normal, failure):
     plt.close()
 
 
-def plot_tradeoff(df):
+def plot_tradeoff(normal, failure):
+    if failure is None:
+        return
+    merged = normal.merge(
+        failure[["pipeline", "workload_id", "IPR"]].rename(columns={"IPR": "IPR_failure"}),
+        on=["pipeline", "workload_id"],
+        how="left",
+    )
+    merged["FLR"] = 1 - merged["IPR_failure"]
     fig, ax = plt.subplots(figsize=(10, 8))
     for p in ["A", "B", "C"]:
-        d = df[df["pipeline"] == p]
-        ax.scatter(d["SRR"], d["IPR"], c=COLORS[p], s=20, alpha=0.5, label=PIPE_NAMES[p])
+        d = merged[merged["pipeline"] == p]
+        ax.scatter(d["SRR"], d["FLR"], c=COLORS[p], s=20, alpha=0.5, label=PIPE_NAMES[p])
     ax.set_xlabel("Storage Reduction Ratio (SRR)")
-    ax.set_ylabel("Information Preservation Ratio (IPR)")
-    ax.set_title("Trade-off: Storage Reduction vs Information Preservation")
-    ax.set_xlim(-0.05, 1.05)
-    ax.set_ylim(0.0, 1.02)
+    ax.set_ylabel("Failure Loss Rate (FLR = 1 − IPR_failure)")
+    ax.set_title("Trade-off: Storage Reduction vs Failure Loss Rate")
     ax.grid(True, alpha=0.3)
     ax.legend()
     plt.tight_layout()
@@ -118,6 +124,69 @@ def plot_srr_by_dup(df):
     plt.close()
 
 
+def plot_ipr_bar_grouped(normal, failure):
+    """Grouped bar chart: IPR per (pipeline, category), normal vs failure."""
+    if failure is None:
+        return
+    cats = ["low", "med", "high"]
+    pipelines = ["A", "B", "C"]
+    nrm = (normal.groupby(["pipeline", "category"])["IPR"].mean()
+           .reindex([(p, c) for p in pipelines for c in cats], fill_value=0.0))
+    flr = (failure.groupby(["pipeline", "category"])["IPR"].mean()
+           .reindex([(p, c) for p in pipelines for c in cats], fill_value=0.0))
+
+    labels = [f"{PIPE_NAMES[p]}\n{c}" for p in pipelines for c in cats]
+    x = np.arange(len(labels))
+    width = 0.38
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    b1 = ax.bar(x - width / 2, nrm.values, width, label="No Failure", color="steelblue")
+    b2 = ax.bar(x + width / 2, flr.values, width, label="With Failure", color="coral")
+
+    for b in (b1, b2):
+        for rect in b:
+            h = rect.get_height()
+            ax.annotate(f"{h:.2f}", xy=(rect.get_x() + rect.get_width() / 2, h),
+                        xytext=(0, 2), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=8)
+
+    for boundary in (2.5, 5.5):
+        ax.axvline(boundary, color="gray", linestyle=":", alpha=0.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("IPR (reconstructed / N)")
+    ax.set_title("IPR by Pipeline and Workload Category: Normal vs Failure")
+    ax.set_ylim(0.0, 1.08)
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "ipr_bar_grouped.png", dpi=300)
+    plt.close()
+
+
+def plot_ipr_vs_dupratio(normal, failure):
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
+    for ax, df, title in [(axes[0], normal, "Normal"),
+                          (axes[1], failure, "With Failure Injection")]:
+        if df is None:
+            ax.set_visible(False)
+            continue
+        for p in ["A", "B", "C"]:
+            d = df[df["pipeline"] == p].sort_values("dup_ratio")
+            ax.scatter(d["dup_ratio"] * 100, d["IPR"], c=COLORS[p], s=20,
+                       alpha=0.6, label=PIPE_NAMES[p])
+        ax.set_xlabel("Duplicate Ratio (%)")
+        ax.set_title(f"IPR vs Workload Duplicate Ratio ({title})")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        ax.set_ylim(0.0, 1.05)
+    axes[0].set_ylabel("IPR (reconstructed / N)")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "ipr_vs_dupratio.png", dpi=300)
+    plt.close()
+
+
 def generate_table(df, failure=None):
     summary = (
         df.groupby(["pipeline", "category"])
@@ -136,7 +205,7 @@ def generate_table(df, failure=None):
             failure.groupby(["pipeline", "category"])["IPR"].mean().rename("IPR_Failure")
         )
         summary = summary.merge(fail_ipr, on=["pipeline", "category"], how="left")
-        summary["FLR_Mean"] = (summary["IPR_Mean"] - summary["IPR_Failure"]).round(4)
+        summary["FLR_Mean"] = (1 - summary["IPR_Failure"]).round(4)
     else:
         summary["IPR_Failure"] = np.nan
         summary["FLR_Mean"] = np.nan
@@ -197,8 +266,10 @@ def analyze_clean_slate(clean_csv, failure_csv):
         print(f"  (no failure run at {failure_csv}; FLR columns will be blank)")
 
     plot_failure_impact(normal, failure)
-    plot_tradeoff(normal)
+    plot_tradeoff(normal, failure)
     plot_srr_by_dup(normal)
+    plot_ipr_vs_dupratio(normal, failure)
+    plot_ipr_bar_grouped(normal, failure)
     table = generate_table(normal, failure)
     table.to_csv(OUTPUT_DIR / "comparison_table.csv", index=False)
     table.to_markdown(OUTPUT_DIR / "comparison_table.md", index=False)

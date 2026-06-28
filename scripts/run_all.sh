@@ -84,7 +84,6 @@ for pipeline in A B C; do
             # injects a mid-stream collector crash.
             run_one "$pipeline" "$id" "$ratio" "$seed" true "$INJECT_FAIL"
         fi
-        sleep 10
     done
 done
 

@@ -23,7 +23,7 @@ fi
 
 OS_URL="http://localhost:9200"
 JOB_TIMEOUT=900       # seconds to wait for the workload Job to complete
-INDEX_POLL_MAX=120    # poll iterations (x10s) waiting for indexing to settle
+INDEX_POLL_MAX=200    # poll iterations (x3s) waiting for indexing to settle
 
 # Robust GET against OpenSearch: retries, and never aborts the script.
 os_get() {
@@ -69,7 +69,6 @@ get_reconstructed() {
 settle_index() {
     curl -s --max-time 120 -X POST "${OS_URL}/$1/_forcemerge?max_num_segments=1&wait_for_completion=true&only_expunge_deletes=false" >/dev/null 2>&1 || true
     curl -s --max-time 30 -X POST "${OS_URL}/$1/_refresh" >/dev/null 2>&1 || true
-    sleep 5
 }
 
 # Background failure injector: wait until indexing crosses ~half the workload,
@@ -94,14 +93,21 @@ inject_failure() {
 # (edge dedup) and C (upsert) barely change the doc count, but every record
 # Fluent Bit forwards still registers as an index operation. After a warm-up
 # grace period, a plateau in index_total means indexing has drained.
-INDEX_WARMUP_POLLS=6
-INDEX_STABLE_POLLS=4
+INDEX_WARMUP_POLLS=3
+INDEX_STABLE_POLLS=3
 wait_for_indexing() {
-    local index=$1 prev=-1 stable=0 i total
+    local index=$1 pipeline=${2:-A} prev=-1 stable=0 i total
     for i in $(seq 1 "$INDEX_POLL_MAX"); do
-        sleep 10
-        total=$(get_index_total "$index")
-        echo "  [poll $i] $index index_total=$total"
+        sleep 3
+        # Pipeline A: every line = one doc, index_total tracks ingest progress.
+        # Pipeline B/C: upsert by signature. index_total inflates from version-
+        # conflict retries on hot keys, so plateau on doc count instead.
+        if [ "$pipeline" = "A" ]; then
+            total=$(get_index_total "$index")
+        else
+            total=$(get_count "$index")
+        fi
+        echo "  [poll $i] $index ($pipeline) metric=$total"
         if [ "$i" -gt "$INDEX_WARMUP_POLLS" ] \
            && [ "$total" -gt 0 ] \
            && [ "$total" -eq "$prev" ] 2>/dev/null; then
@@ -115,7 +121,7 @@ wait_for_indexing() {
         fi
         prev=$total
     done
-    echo "  WARN: indexing for '$index' did not settle within $((INDEX_POLL_MAX * 10))s"
+    echo "  WARN: indexing for '$index' did not settle within $((INDEX_POLL_MAX * 3))s"
 }
 
 # Always remove the previous workload Job first: a Job's pod template is
@@ -130,7 +136,7 @@ if [ "$CLEAN_SLATE" = "true" ]; then
     curl -s -X POST "${OS_URL}/_cache/clear" >/dev/null 2>&1 || true
     kubectl rollout restart daemonset fluent-bit -n logging
     kubectl rollout status daemonset fluent-bit -n logging --timeout=180s
-    sleep 30
+    sleep 5
 fi
 
 # Deploy the workload Job.
@@ -202,7 +208,7 @@ if [ "$FAIL" = "true" ]; then
 fi
 
 echo "Waiting for Fluent Bit to finish indexing into '$INDEX_NAME'..."
-wait_for_indexing "$INDEX_NAME"
+wait_for_indexing "$INDEX_NAME" "$PIPELINE"
 [ -n "${FAIL_PID:-}" ] && wait "$FAIL_PID" 2>/dev/null || true
 
 # Stabilize storage and counts before measuring.

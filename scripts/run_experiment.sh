@@ -158,6 +158,12 @@ if [ "$CLEAN_SLATE" = "true" ]; then
     echo "=== CLEAN SLATE ==="
     curl -s -X DELETE "${OS_URL}/_all?expand_wildcards=all&allow_no_indices=true" >/dev/null 2>&1 || true
     curl -s -X POST "${OS_URL}/_cache/clear" >/dev/null 2>&1 || true
+    # Install/refresh index template so new ingest indices use a longer
+    # refresh_interval (less segment thrash) and no replicas (single-node).
+    curl -s -X PUT "${OS_URL}/_index_template/ingest" \
+        -H 'Content-Type: application/json' \
+        -d '{"index_patterns":["logs","logs-edge","logs-index"],"template":{"settings":{"refresh_interval":"30s","number_of_replicas":0}}}' \
+        >/dev/null 2>&1 || true
     kubectl rollout restart daemonset fluent-bit -n logging
     kubectl rollout status daemonset fluent-bit -n logging --timeout=180s
     sleep 5

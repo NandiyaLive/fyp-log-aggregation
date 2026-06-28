@@ -126,14 +126,11 @@ wait_for_indexing() {
     local index=$1 pipeline=${2:-A} prev=-1 stable=0 i total
     for i in $(seq 1 "$INDEX_POLL_MAX"); do
         sleep 3
-        # Pipeline A: every line = one doc, index_total tracks ingest progress.
-        # Pipeline B/C: upsert by signature. index_total inflates from version-
-        # conflict retries on hot keys, so plateau on doc count instead.
-        if [ "$pipeline" = "A" ]; then
-            total=$(get_index_total "$index")
-        else
-            total=$(get_count "$index")
-        fi
+        # Use doc count for all pipelines. index_total resets to 0 when the
+        # OpenSearch pod restarts (failure-mode sink kill), which makes plateau
+        # detection stick at zero forever. _count is computed from the index
+        # itself, so it survives pod restart.
+        total=$(get_count "$index")
         # Coerce empty / non-numeric output to 0 so `[ ... -gt ... ]` is safe.
         case "$total" in
             ''|*[!0-9]*) total=0 ;;

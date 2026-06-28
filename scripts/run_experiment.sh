@@ -82,6 +82,9 @@ inject_failure() {
     for i in $(seq 1 "$INDEX_POLL_MAX"); do
         sleep 5
         total=$(get_index_total "$index")
+        case "$total" in
+            ''|*[!0-9]*) total=0 ;;
+        esac
         if [ "$total" -ge "$threshold" ] 2>/dev/null; then
             case "$target" in
                 fb)
@@ -131,6 +134,10 @@ wait_for_indexing() {
         else
             total=$(get_count "$index")
         fi
+        # Coerce empty / non-numeric output to 0 so `[ ... -gt ... ]` is safe.
+        case "$total" in
+            ''|*[!0-9]*) total=0 ;;
+        esac
         echo "  [poll $i] $index ($pipeline) metric=$total"
         if [ "$i" -gt "$INDEX_WARMUP_POLLS" ] \
            && [ "$total" -gt 0 ] \

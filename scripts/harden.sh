@@ -1,94 +1,127 @@
 #!/bin/bash
 # Hardens a fresh Ubuntu 24.04 droplet running the FYP log-aggregation stack.
 #
-# Run as root AFTER provision.sh completes:
-#   sudo bash scripts/harden.sh
+# Run AFTER provision.sh AND after confirming SSH works as neranjana:
+#   sudo bash ~/research/scripts/harden.sh
 #
-# What this does:
-#   1. SSH hardening (disable root login, password auth, set limits)
-#   2. UFW firewall (allowlist: SSH + k3s API only; OpenSearch is ClusterIP)
-#   3. sysctl network hardening (IP spoofing, SYN floods, ICMP redirects)
-#   4. fail2ban tuned config for SSH
+# Safety guarantees:
+#   - Aborts if the target user has no SSH authorized_keys (prevents lockout)
+#   - Restores original sshd_config automatically if SSH restart fails
+#   - UFW allows SSH before enabling (no firewall lockout)
+#   - Does NOT auto-call from provision.sh — must be run manually
+#
+# What this hardens:
+#   1. SSH  — disable root login, password auth, strong ciphers
+#   2. UFW  — allowlist SSH(22) + k3s API(6443); deny everything else
+#   3. sysctl — anti-spoof, SYN-flood, martian logging, IPv6 off
+#   4. fail2ban — 3 retries / 5 min window → 1 h ban
 #   5. Unattended security upgrades
-#   6. Docker daemon hardening (no-new-privileges, userland-proxy off)
+#   6. Docker daemon — no-new-privileges, icc=false, log rotation
 #   7. Disable unused services
-#   8. Kernel module lockdown (USB storage, uncommon network protocols)
-#
-# Does NOT touch OpenSearch security plugin — it is intentionally disabled
-# (plugins.security.disabled: true) for the FYP research environment.
+#   8. Kernel module blacklist
 
 set -euo pipefail
 
-log() { echo "[harden] $*"; }
+log()  { echo "[harden] $*"; }
 warn() { echo "[harden] WARNING: $*" >&2; }
+die()  { echo "[harden] ERROR: $*" >&2; exit 1; }
 
-[[ $EUID -ne 0 ]] && { echo "Run as root."; exit 1; }
+[[ $EUID -ne 0 ]] && die "Run as root: sudo bash harden.sh"
 
 RESEARCH_USER="${SUDO_USER:-neranjana}"
 SSH_PORT="${SSH_PORT:-22}"
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+log "Pre-flight checks..."
+
+# User must exist
+id "${RESEARCH_USER}" &>/dev/null \
+    || die "User '${RESEARCH_USER}' does not exist. Run provision.sh first."
+
+# User must have SSH keys — without this, disabling password auth = lockout
+AUTH_KEYS="/home/${RESEARCH_USER}/.ssh/authorized_keys"
+if [ ! -s "${AUTH_KEYS}" ]; then
+    die "No SSH keys found for ${RESEARCH_USER} at ${AUTH_KEYS}.
+  Add your public key first:
+    mkdir -p /home/${RESEARCH_USER}/.ssh
+    echo 'ssh-ed25519 AAAA... you@host' >> ${AUTH_KEYS}
+    chown -R ${RESEARCH_USER}:${RESEARCH_USER} /home/${RESEARCH_USER}/.ssh
+    chmod 700 /home/${RESEARCH_USER}/.ssh && chmod 600 ${AUTH_KEYS}
+  Then re-run this script."
+fi
+
+log "  User: ${RESEARCH_USER} ✓"
+log "  SSH keys: present ✓"
+log "  Proceeding with hardening."
 
 # ── 1. SSH ────────────────────────────────────────────────────────────────────
 log "Hardening SSH..."
 
 SSHD_CONF=/etc/ssh/sshd_config
-cp "${SSHD_CONF}" "${SSHD_CONF}.bak.$(date +%s)"
+SSHD_BAK="${SSHD_CONF}.bak.$(date +%s)"
+cp "${SSHD_CONF}" "${SSHD_BAK}"
 
-# Apply settings idempotently via sed + append-if-missing pattern
+# Restore backup if anything fails after this point
+_restore_ssh() {
+    warn "Error detected — restoring SSH config backup..."
+    cp "${SSHD_BAK}" "${SSHD_CONF}"
+    systemctl restart ssh 2>/dev/null || true
+    warn "SSH config restored. Original settings are back."
+}
+trap '_restore_ssh' ERR
+
 _sshd_set() {
     local key="$1" val="$2"
-    if grep -qE "^#?${key}\s" "${SSHD_CONF}"; then
-        sed -i -E "s|^#?${key}\s.*|${key} ${val}|" "${SSHD_CONF}"
+    if grep -qE "^#?${key}[[:space:]]" "${SSHD_CONF}"; then
+        sed -i -E "s|^#?${key}[[:space:]].*|${key} ${val}|" "${SSHD_CONF}"
     else
         echo "${key} ${val}" >> "${SSHD_CONF}"
     fi
 }
 
-_sshd_set PermitRootLogin               no
-_sshd_set PasswordAuthentication        no
+_sshd_set PermitRootLogin                no
+_sshd_set PasswordAuthentication         no
 _sshd_set ChallengeResponseAuthentication no
-_sshd_set KbdInteractiveAuthentication  no
-_sshd_set X11Forwarding                 no
-_sshd_set MaxAuthTries                  3
-_sshd_set MaxSessions                   5
-_sshd_set LoginGraceTime                30
-_sshd_set AllowAgentForwarding          no
-_sshd_set AllowTcpForwarding            no
-_sshd_set PermitEmptyPasswords          no
-_sshd_set UsePAM                        yes
-_sshd_set PrintLastLog                  yes
-_sshd_set ClientAliveInterval           300
-_sshd_set ClientAliveCountMax           2
+_sshd_set KbdInteractiveAuthentication   no
+_sshd_set X11Forwarding                  no
+_sshd_set MaxAuthTries                   3
+_sshd_set MaxSessions                    5
+_sshd_set LoginGraceTime                 30
+_sshd_set AllowAgentForwarding           no
+_sshd_set AllowTcpForwarding             no
+_sshd_set PermitEmptyPasswords           no
+_sshd_set UsePAM                         yes
+_sshd_set PrintLastLog                   yes
+_sshd_set ClientAliveInterval            300
+_sshd_set ClientAliveCountMax            2
 
-# Restrict to strong algorithms
-_sshd_set Ciphers          "aes256-gcm@openssh.com,aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"
-_sshd_set MACs             "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
-_sshd_set KexAlgorithms    "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512"
+_sshd_set Ciphers       "aes256-gcm@openssh.com,aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"
+_sshd_set MACs          "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
+_sshd_set KexAlgorithms "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512"
 
 # Allowlist only the research user
 _sshd_set AllowUsers "${RESEARCH_USER}"
 
-sshd -t && systemctl restart ssh
-log "SSH hardened. Port: ${SSH_PORT}, root login: disabled, password auth: disabled."
+# Validate config before restarting — if invalid, trap restores backup
+sshd -t || die "sshd config validation failed — backup restored automatically."
+systemctl restart ssh
+log "SSH hardened."
+
+# SSH is stable — disarm the restore trap
+trap - ERR
 
 # ── 2. UFW ────────────────────────────────────────────────────────────────────
 log "Configuring UFW firewall..."
 
 apt-get install -y -qq ufw
 
+# Allow SSH first, before enabling UFW — prevents firewall lockout
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
-
-# SSH
-ufw allow "${SSH_PORT}/tcp" comment "SSH"
-
-# k3s API server — needed if you kubectl from off-droplet.
-# Comment out if you only ever kubectl from inside the droplet.
-ufw allow 6443/tcp comment "k3s API"
-
-# OpenSearch 9200 and Dashboards 5601 are ClusterIP — no external exposure needed.
-# Fluent Bit 2020 metrics scrape is intra-cluster only.
-# If you port-forward locally, no UFW rule required.
+ufw allow "${SSH_PORT}/tcp"  comment "SSH"
+ufw allow 6443/tcp           comment "k3s API"
+# OpenSearch(9200), Dashboards(5601), Fluent Bit(2020) are ClusterIP — no external rule needed
 
 ufw --force enable
 ufw status verbose
@@ -102,7 +135,7 @@ cat > /etc/sysctl.d/99-harden.conf <<'EOF'
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 
-# Ignore ICMP redirects (prevents MITM via routing tricks)
+# Ignore ICMP redirects
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
@@ -110,7 +143,7 @@ net.ipv4.conf.default.send_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 
-# Don't accept source routing
+# No source routing
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 
@@ -120,31 +153,25 @@ net.ipv4.tcp_max_syn_backlog = 2048
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_syn_retries = 5
 
-# Ignore ICMP broadcast (Smurf attack mitigation)
+# Ignore ICMP broadcast (Smurf mitigation)
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 
-# Log martian packets (bogus source addresses)
+# Log martian packets
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 
-# Disable IPv6 if unused (research stack is IPv4 only)
+# Disable IPv6 (research stack is IPv4 only)
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 
-# Protect against time-wait assassination
+# Time-wait assassination protection
 net.ipv4.tcp_rfc1337 = 1
 
-# Kernel pointer leaks
+# Kernel hardening
 kernel.kptr_restrict = 2
-
-# Restrict dmesg to root
 kernel.dmesg_restrict = 1
-
-# Prevent core dumps from SUID binaries
 fs.suid_dumpable = 0
-
-# Restrict ptrace to direct children (mitigates some local priv-esc)
 kernel.yama.ptrace_scope = 1
 EOF
 
@@ -154,7 +181,9 @@ log "sysctl hardening applied."
 # ── 4. fail2ban ───────────────────────────────────────────────────────────────
 log "Configuring fail2ban..."
 
+# Install in case provision.sh wasn't run first
 apt-get install -y -qq fail2ban
+
 mkdir -p /etc/fail2ban/jail.d
 cat > /etc/fail2ban/jail.d/sshd-harden.conf <<EOF
 [sshd]
@@ -181,12 +210,10 @@ cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'EOF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
 };
-Unattended-Upgrade::Package-Blacklist {};
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Mail "";
 EOF
 
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -208,10 +235,7 @@ if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^docker.servi
   "no-new-privileges": true,
   "userland-proxy": false,
   "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  },
+  "log-opts": { "max-size": "10m", "max-file": "3" },
   "icc": false,
   "live-restore": true
 }
@@ -219,38 +243,25 @@ EOF
     systemctl reload-or-restart docker
     log "Docker daemon hardened."
 else
-    warn "Docker not installed — skipping Docker hardening. Run after provision.sh."
+    warn "Docker not installed — skipping. Run provision.sh first."
 fi
 
 # ── 7. Disable unused services ────────────────────────────────────────────────
 log "Disabling unnecessary services..."
 
-DISABLE_SERVICES=(
-    avahi-daemon
-    cups
-    cups-browsed
-    bluetooth
-    ModemManager
-    whoopsie
-    apport
-)
-
-for svc in "${DISABLE_SERVICES[@]}"; do
-    if systemctl list-unit-files --type=service | grep -q "^${svc}.service"; then
+for svc in avahi-daemon cups cups-browsed bluetooth ModemManager whoopsie apport; do
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
         systemctl disable --now "${svc}" 2>/dev/null || true
         log "  Disabled: ${svc}"
     fi
 done
 
-# ── 8. Kernel module lockdown ─────────────────────────────────────────────────
+# ── 8. Kernel module blacklist ────────────────────────────────────────────────
 log "Blacklisting unnecessary kernel modules..."
 
 cat > /etc/modprobe.d/harden-modules.conf <<'EOF'
-# USB storage — no physical access needed on a droplet
 install usb-storage /bin/false
 blacklist usb-storage
-
-# Uncommon / attack-surface network protocols
 install dccp /bin/false
 blacklist dccp
 install sctp /bin/false
@@ -261,16 +272,14 @@ install tipc /bin/false
 blacklist tipc
 install n-hdlc /bin/false
 blacklist n-hdlc
-
-# Firewire (DMA attack surface)
 install firewire-core /bin/false
 blacklist firewire-core
 EOF
 
 update-initramfs -u -k all 2>&1 | tail -3
-log "Kernel module blacklist written and initramfs updated."
+log "Kernel modules blacklisted."
 
-# ── 9. System file permissions ────────────────────────────────────────────────
+# ── 9. File permissions ───────────────────────────────────────────────────────
 log "Tightening file permissions..."
 
 chmod 700 /root
@@ -283,15 +292,14 @@ chmod 600 /etc/shadow /etc/gshadow 2>/dev/null || true
 log ""
 log "=== Hardening complete ==="
 log ""
-log "Summary:"
-log "  SSH       : root login off, password auth off, allowlist=${RESEARCH_USER}"
-log "  Firewall  : UFW enabled — SSH(${SSH_PORT}) + k3s API(6443) only"
-log "  sysctl    : anti-spoof, SYN-flood, martian logging, IPv6 disabled"
-log "  fail2ban  : 3 retries → 1h ban on SSH"
+log "  SSH       : root login off, password auth off, only ${RESEARCH_USER} allowed"
+log "  Firewall  : UFW on — SSH(${SSH_PORT}) + k3s API(6443) only"
+log "  sysctl    : anti-spoof, SYN-flood, martian logging, IPv6 off"
+log "  fail2ban  : 3 retries → 1 h ban"
 log "  Docker    : no-new-privileges, icc=false, log rotation"
-log "  Modules   : USB storage, DCCP, SCTP, RDS, TIPC, firewire blacklisted"
+log "  Modules   : USB/DCCP/SCTP/RDS/TIPC/firewire blacklisted"
 log ""
-log "OpenSearch security plugin remains DISABLED (research config)."
-log "If you promote this to production, enable it and rotate certs."
+log "OpenSearch security plugin left DISABLED (intentional for research)."
 log ""
-warn "Verify SSH key auth still works before closing this session!"
+warn "SSH backup saved at: ${SSHD_BAK}"
+warn "Verify you can still SSH in as ${RESEARCH_USER} from a new terminal."

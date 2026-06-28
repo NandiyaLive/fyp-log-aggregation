@@ -154,6 +154,7 @@ log "sysctl hardening applied."
 # ── 4. fail2ban ───────────────────────────────────────────────────────────────
 log "Configuring fail2ban..."
 
+mkdir -p /etc/fail2ban/jail.d
 cat > /etc/fail2ban/jail.d/sshd-harden.conf <<EOF
 [sshd]
 enabled  = true

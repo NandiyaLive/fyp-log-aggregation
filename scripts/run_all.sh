@@ -12,10 +12,10 @@ if [ "$MODE" != "clean_slate" ] && [ "$MODE" != "no_clean_slate" ] && [ "$MODE" 
     exit 1
 fi
 
-# failure mode: same as clean_slate but injects a real collector crash into
-# every run so the analysis can compute empirical FLR.
+# failure mode: same as clean_slate but kills the OpenSearch pod mid-stream so
+# the analysis can compute empirical FLR under a sink crash.
 INJECT_FAIL=false
-[ "$MODE" = "failure" ] && INJECT_FAIL=true
+[ "$MODE" = "failure" ] && INJECT_FAIL=os
 
 # Sanity check: OpenSearch must be reachable via the port-forward.
 if ! curl -s --max-time 10 http://localhost:9200 > /dev/null 2>&1; then

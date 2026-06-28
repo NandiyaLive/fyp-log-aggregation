@@ -15,6 +15,8 @@ DUP_RATIO=${3:-}
 SEED=${4:-}
 CLEAN_SLATE=${5:-true}
 FAIL=${6:-false}
+# Backward compat: legacy callers pass "true" meaning Fluent Bit kill.
+[ "$FAIL" = "true" ] && FAIL=fb
 
 if [ -z "$PIPELINE" ] || [ -z "$WL_ID" ] || [ -z "$DUP_RATIO" ] || [ -z "$SEED" ]; then
     echo "Usage: $0 <A|B|C> <wl_id> <dup_ratio> <seed> [clean_slate] [fail]" >&2
@@ -72,16 +74,38 @@ settle_index() {
 }
 
 # Background failure injector: wait until indexing crosses ~half the workload,
-# then delete the Fluent Bit pod once.
+# then kill the chosen target once. target=fb (Fluent Bit, edge-loss) or
+# os (OpenSearch, sink-loss).
 TOTAL_LOGS=1000000
 inject_failure() {
-    local index=$1 threshold=$((TOTAL_LOGS / 2)) i total
+    local index=$1 target=${2:-fb} threshold=$((TOTAL_LOGS / 2)) i total
     for i in $(seq 1 "$INDEX_POLL_MAX"); do
         sleep 5
         total=$(get_index_total "$index")
         if [ "$total" -ge "$threshold" ] 2>/dev/null; then
-            echo "  [FAIL-INJECT] index_total=$total >= $threshold : killing Fluent Bit pod"
-            kubectl delete pod -l k8s-app=fluent-bit -n logging --grace-period=0 --force >/dev/null 2>&1 || true
+            case "$target" in
+                fb)
+                    echo "  [FAIL-INJECT] index_total=$total >= $threshold : killing Fluent Bit pod"
+                    kubectl delete pod -l k8s-app=fluent-bit -n logging --grace-period=0 --force >/dev/null 2>&1 || true
+                    ;;
+                os)
+                    echo "  [FAIL-INJECT] index_total=$total >= $threshold : killing OpenSearch pod"
+                    kubectl delete pod opensearch-cluster-master-0 -n logging --grace-period=0 --force >/dev/null 2>&1 || true
+                    # Block until cluster recovers so wait_for_indexing does not
+                    # mistake the downtime for a real plateau.
+                    local j
+                    for j in $(seq 1 60); do
+                        if curl -sf --max-time 5 "${OS_URL}/_cluster/health?wait_for_status=yellow&timeout=5s" >/dev/null 2>&1; then
+                            echo "  [FAIL-INJECT] OpenSearch back to yellow after ${j} poll(s)"
+                            break
+                        fi
+                        sleep 5
+                    done
+                    ;;
+                *)
+                    echo "  [FAIL-INJECT] unknown target '$target'; skipping"
+                    ;;
+            esac
             return 0
         fi
     done
@@ -201,9 +225,10 @@ INDEX_NAME="logs"
 [ "$PIPELINE" = "C" ] && INDEX_NAME="logs-index"
 
 # Optional crash injection runs concurrently with indexing.
-if [ "$FAIL" = "true" ]; then
-    echo "Failure mode ON: will crash Fluent Bit at ~50% indexed."
-    inject_failure "$INDEX_NAME" &
+# FAIL values: false | fb (Fluent Bit kill) | os (OpenSearch kill).
+if [ "$FAIL" = "fb" ] || [ "$FAIL" = "os" ]; then
+    echo "Failure mode ON ($FAIL): will crash target at ~50% indexed."
+    inject_failure "$INDEX_NAME" "$FAIL" &
     FAIL_PID=$!
 fi
 

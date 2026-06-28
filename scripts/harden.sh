@@ -67,7 +67,7 @@ _sshd_set KexAlgorithms    "curve25519-sha256,curve25519-sha256@libssh.org,diffi
 # Allowlist only the research user
 _sshd_set AllowUsers "${RESEARCH_USER}"
 
-sshd -t && systemctl restart sshd
+sshd -t && systemctl restart ssh
 log "SSH hardened. Port: ${SSH_PORT}, root login: disabled, password auth: disabled."
 
 # ── 2. UFW ────────────────────────────────────────────────────────────────────

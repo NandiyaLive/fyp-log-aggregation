@@ -12,10 +12,13 @@ if [ "$MODE" != "clean_slate" ] && [ "$MODE" != "no_clean_slate" ] && [ "$MODE" 
     exit 1
 fi
 
-# failure mode: same as clean_slate but kills the OpenSearch pod mid-stream so
-# the analysis can compute empirical FLR under a sink crash.
+# failure mode: same as clean_slate but kills the Fluent Bit pod mid-stream so
+# the analysis can compute empirical FLR under a collector (edge) crash. This is
+# the failure the study is about: aggregation state lives in the collector, so
+# killing it is what puts information at risk. The `os` target below injects a
+# sink crash instead and is NOT what the recorded results measure.
 INJECT_FAIL=false
-[ "$MODE" = "failure" ] && INJECT_FAIL=os
+[ "$MODE" = "failure" ] && INJECT_FAIL=fb
 
 # Sanity check: OpenSearch must be reachable via the port-forward.
 if ! curl -s --max-time 10 http://localhost:9200 > /dev/null 2>&1; then
@@ -35,7 +38,7 @@ fi
 
 CSV="results/experiments_${MODE}.csv"
 FAILLOG="results/failures_${MODE}.log"
-echo "pipeline,workload_id,dup_ratio,seed,N,M,storage,total_storage,reconstructed,failed,timestamp" > "$CSV"
+echo "pipeline,workload_id,dup_ratio,seed,N,M,storage,total_storage,reconstructed,failed,settled,timestamp" > "$CSV"
 : > "$FAILLOG"
 
 # Run one experiment; append its result row on success, log it on failure.

@@ -90,9 +90,16 @@ log "Docker installed."
 
 # ── 3. k3s ────────────────────────────────────────────────────────────────────
 log "Installing k3s ${K3S_VERSION}..."
+# container-log-max-size/files: kubelet rotates and DELETES container logs at
+# its default ~10Mi x 5 files. A 1M-line workload emits ~220MB, so the default
+# deletes most of the log before Fluent Bit can tail it -> permanent, unintended
+# loss that corrupts the baseline. Raise the cap so a whole workload log fits in
+# one un-rotated file and survives until it is fully read.
 curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${K3S_VERSION}" sh -s - server \
     --disable traefik \
-    --write-kubeconfig-mode 644
+    --write-kubeconfig-mode 644 \
+    --kubelet-arg "container-log-max-size=1Gi" \
+    --kubelet-arg "container-log-max-files=2"
 
 log "Waiting for k3s node to be Ready..."
 until k3s kubectl get nodes | grep -q " Ready"; do sleep 3; done

@@ -68,9 +68,42 @@ get_reconstructed() {
 # Force a single segment and refresh so store-size and counts are stable and
 # comparable across pipelines (upsert churn otherwise leaves deleted-doc bloat
 # that makes index-time look far larger than it really is).
+#
+# The merge is kicked off asynchronously and then verified by polling the index
+# itself. A synchronous merge with a client-side timeout is not safe here: on
+# ~1M docs the merge sometimes runs longer than the timeout, curl aborts, and
+# the caller reads the pre-merge store size -- a 2-4x inflated number that looks
+# like a real result. Polling segment count and deleted docs means the recorded
+# size is only ever read from a genuinely merged index.
+SETTLE_POLL_MAX=90           # x10s = up to 15 min for the merge to land
 settle_index() {
-    curl -s --max-time 120 -X POST "${OS_URL}/$1/_forcemerge?max_num_segments=1&wait_for_completion=true&only_expunge_deletes=false" >/dev/null 2>&1 || true
-    curl -s --max-time 30 -X POST "${OS_URL}/$1/_refresh" >/dev/null 2>&1 || true
+    local index=$1 i segs deleted
+    curl -s --max-time 30 -X POST \
+        "${OS_URL}/${index}/_forcemerge?max_num_segments=1&wait_for_completion=false&only_expunge_deletes=false" \
+        >/dev/null 2>&1 || true
+
+    for i in $(seq 1 "$SETTLE_POLL_MAX"); do
+        sleep 10
+        segs=$(os_get "/${index}/_segments" \
+            | jq -r '[.indices[].shards[][].segments | length] | add // -1' 2>/dev/null || echo -1)
+        deleted=$(os_get "/${index}/_stats/docs" \
+            | jq -r '._all.primaries.docs.deleted // -1' 2>/dev/null || echo -1)
+        case "$segs"    in ''|*[!0-9-]*) segs=-1 ;; esac
+        case "$deleted" in ''|*[!0-9-]*) deleted=-1 ;; esac
+
+        if [ "$segs" -ge 0 ] && [ "$segs" -le 1 ] && [ "$deleted" -eq 0 ] 2>/dev/null; then
+            echo "  index settled (segments=$segs deleted_docs=$deleted after $((i * 10))s)"
+            curl -s --max-time 30 -X POST "${OS_URL}/${index}/_refresh" >/dev/null 2>&1 || true
+            return 0
+        fi
+    done
+
+    # Never silently record a bloated size: the caller's storage number would be
+    # wrong by 2-4x and indistinguishable from a real measurement.
+    echo "  WARN: '$index' did not merge to a single segment within $((SETTLE_POLL_MAX * 10))s" >&2
+    echo "  WARN: recorded storage for this run is pre-merge and must be discarded" >&2
+    curl -s --max-time 30 -X POST "${OS_URL}/${index}/_refresh" >/dev/null 2>&1 || true
+    return 1
 }
 
 # Background failure injector: wait until indexing crosses ~half the workload,
@@ -255,8 +288,11 @@ echo "Waiting for Fluent Bit to finish indexing into '$INDEX_NAME'..."
 wait_for_indexing "$INDEX_NAME" "$PIPELINE"
 [ -n "${FAIL_PID:-}" ] && wait "$FAIL_PID" 2>/dev/null || true
 
-# Stabilize storage and counts before measuring.
-settle_index "$INDEX_NAME"
+# Stabilize storage and counts before measuring. A run whose merge never landed
+# still records its numbers, but is marked settled=false so the analysis can
+# exclude its storage figure (doc counts stay valid either way).
+SETTLED=true
+settle_index "$INDEX_NAME" || SETTLED=false
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RESULT_DIR="results/${PIPELINE}_wl${WL_ID}_${TIMESTAMP}"
@@ -280,8 +316,9 @@ echo "$STATS" > "$RESULT_DIR/stats.json"
 echo "$STORAGE" > "$RESULT_DIR/storage.txt"
 echo "$TOTAL_STORAGE" > "$RESULT_DIR/total_storage.txt"
 echo "$RECON" > "$RESULT_DIR/reconstructed.txt"
+echo "$SETTLED" > "$RESULT_DIR/settled.txt"
 
 mkdir -p results
-echo "${PIPELINE},${WL_ID},${DUP_RATIO},${SEED},${TOTAL_LOGS},${DOC_COUNT},${STORAGE},${TOTAL_STORAGE},${RECON},${FAIL},${TIMESTAMP}" >> results/experiments.csv
+echo "${PIPELINE},${WL_ID},${DUP_RATIO},${SEED},${TOTAL_LOGS},${DOC_COUNT},${STORAGE},${TOTAL_STORAGE},${RECON},${FAIL},${SETTLED},${TIMESTAMP}" >> results/experiments.csv
 
-echo "Done: $RESULT_DIR | Docs=$DOC_COUNT | Storage=$STORAGE | Recon=$RECON | Failed=$FAIL"
+echo "Done: $RESULT_DIR | Docs=$DOC_COUNT | Storage=$STORAGE | Recon=$RECON | Failed=$FAIL | Settled=$SETTLED"
